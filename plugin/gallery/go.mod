@@ -1,4 +1,4 @@
-module github.com/pointlet/plinth
+module github.com/pointlet/plinth/plugin/gallery
 
 go 1.25.6
 
