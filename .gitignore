@@ -14,8 +14,7 @@ plinth
 # Output of go coverage
 *.out
 
-# Go workspace
-go.work
+# Go workspace sum (go.work itself is committed)
 go.work.sum
 
 # IDE
@@ -34,3 +33,6 @@ Thumbs.db
 
 # Plugin binaries
 /plugin/*/plugin
+
+# Working memory file
+working-memory.md

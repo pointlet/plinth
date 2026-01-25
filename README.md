@@ -13,30 +13,58 @@ Want a web UI? That's a plugin. Need encryption? Also a plugin. For compression,
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                      CORE (headless)                            │
-│  ┌─────────────┐  ┌─────────────┐  ┌──────────────────────┐    │
-│  │   Storage   │  │   Plugin    │  │      gRPC API        │    │
-│  │   Engine    │  │   Registry  │  │   Storage ops        │    │
-│  │             │  │   + Loader  │  │   Plugin register    │    │
-│  └─────────────┘  └─────────────┘  └──────────────────────┘    │
+│  ┌─────────────┐  ┌─────────────┐  ┌──────────────────────┐     │
+│  │   Storage   │  │   Plugin    │  │    HTTP Reverse      │     │  
+│  │   Engine    │  │   Registry  │  │    Proxy + gRPC API  │     │
+│  │             │  │   + Loader  │  │                      │     │
+│  └─────────────┘  └─────────────┘  └──────────────────────┘     │
+│  ┌──────────────────────────────┐                               │
+│  │   Pipeline Engine            │                               │
+│  │   (in-process middleware)    │                               │
+│  └──────────────────────────────┘                               │
 └─────────────────────────────────────────────────────────────────┘
                               ▲
-                              │ Unix Sockets
+                              │ gRPC over Unix Sockets
         ┌─────────────────────┼─────────────────────┐
         ▼                     ▼                     ▼
-   ┌─────────┐           ┌─────────┐           ┌─────────┐
-   │   web   │           │ gallery │           │ encrypt │
-   └─────────┘           └─────────┘           └─────────┘
+   ┌──────────┐          ┌──────────┐          ┌──────────┐
+   │   web    │          │ gallery  │          │  hello   │
+   │(endpoint)│          │(endpoint)│          │(endpoint)│
+   └──────────┘          └──────────┘          └──────────┘
 ```
 
-Core is the brain. Plugins are the limbs.
+Core is the brain. Endpoint plugins are the limbs. Middleware plugins live inside core as in-process transforms.
+
+## Two-Tier Plugin System
+
+Plinth uses two fundamentally different plugin types with different execution models:
+
+### Endpoint Plugins (out-of-process)
+
+Endpoint plugins are separate binaries that communicate with core via gRPC over Unix sockets using HashiCorp go-plugin. They serve HTTP routes, render UI, and handle user interaction.
+
+This is where crash isolation matters. A buggy third-party endpoint plugin cannot take down core. If an endpoint plugin crashes, core detects it, logs the failure, and restarts it with exponential backoff. The rest of the system stays up.
+
+Endpoint plugins can be written in any language that implements the gRPC service contract and the go-plugin handshake protocol.
+
+### Middleware Plugins (in-process)
+
+Middleware plugins are Go packages compiled into the core binary. They implement a simple `io.Reader`/`io.Writer` streaming interface and transform data as it flows through pipelines.
+
+Middleware sits in the hot data path. Serializing megabytes of file data through gRPC for every compress or encrypt call would be wasteful. In-process execution gives zero-copy streaming with native error handling.
+
+Third-party middleware authors publish Go packages implementing the `sdk.Middleware` interface. Users build a custom core binary that imports the packages they need. This follows the same pattern used by Caddy and Hugo.
+
+**Official middleware** (compress, encrypt) ships with the default build.
+
+**Third-party middleware** is included by specifying filesystem paths in a build configuration, then compiling a custom binary.
+
+| Type | Execution | Crash Isolation | Language | Example |
+|------|-----------|-----------------|----------|---------|
+| `endpoint` | Out-of-process (gRPC) | Yes | Any (Go, Python, Rust) | web, gallery |
+| `middleware` | In-process (Go interface) | No (recover on panic) | Go only | compress, encrypt |
 
 ## How It Works
-
-### Communication
-
-Plugins are separate binaries that talk to core via gRPC over Unix sockets.
-
-This means plugins can be written in any language that speaks gRPC, whether that's Go, Python, Rust, or something else entirely. It also means a plugin crash won't take down core, and there are no shared memory headaches to deal with.
 
 ### Data Flow
 
@@ -52,97 +80,301 @@ Plugin A                    Core                    Plugin B
 
 This keeps plugins decoupled. Plugin B doesn't need to know Plugin A exists.
 
-### Plugin Configuration
-
-Users define their own names for plugins and map them to binaries:
-
-```yaml
-plugins:
-  compress: /path/to/gzip-plugin
-  encrypt: /path/to/age-plugin
-  store: /path/to/s3-plugin
-```
-
-This means you control the naming. Want short names? Use them. Prefer verbose? Go for it. If you ever want to swap gzip for zstd, just change the path. Pipelines stay the same.
-
 ### Pipelines
 
-Pipelines reference plugins by the names you defined:
+Pipelines chain middleware plugins together to process files on upload or download. They are defined in the YAML config:
 
 ```yaml
 pipelines:
   upload:
-    - compress
-    - encrypt
-    - store
+    steps:
+      - compress
+      - encrypt
+    on_error: fail
 
   download:
-    - decrypt
-    - decompress
+    steps:
+      - decrypt
+      - decompress
+    on_error: fail
 ```
 
-You can also build pipelines in code using a string-based builder:
+Each step receives an `io.Reader` from the previous step and produces an `io.Reader` for the next. Core pipes the output of each middleware directly into the input of the next with zero intermediate copies.
 
-```
-Pipeline().Use("compress").Use("encrypt").Use("store").Run(file)
+### Pipeline Data Contract
+
+Data flows between pipeline steps as a byte stream with metadata:
+
+```go
+type FileContext struct {
+    ContentType string            // e.g., "image/png", "video/mp4"
+    Filename    string            // original filename
+    Size        int64             // total size if known, -1 if streaming
+    Extra       map[string]string // opaque metadata between steps
+}
 ```
 
-Or reference predefined pipelines by name:
+The `Extra` field carries information between steps without core needing to understand it:
 
-```
-Process(file, "upload")
-```
+- A compress plugin sets `extra["compression"] = "zstd"` so decompress knows the algorithm.
+- An encrypt plugin sets `extra["encrypted"] = "true"` and `extra["key_id"] = "user-key-1"`.
+
+Core does not parse `Extra`. It only reads `ContentType` for pipeline compatibility validation at startup.
+
+### Error Handling
+
+When a pipeline step fails or a middleware plugin panics, the pipeline operation fails and core reports the error to the caller. Steps are sequential dependencies — if compress fails, the file is not stored half-processed.
+
+Core itself does not crash. It logs the error and continues serving other requests. The failure is scoped to that single file operation.
 
 ### Startup Health Check
 
-When core starts, it runs a health check against all configured plugins. It tries to connect to each one and reports the results.
+When core starts, it connects to each configured endpoint plugin and reports the results:
 
 ```
-[OK]   compress    /path/to/gzip-plugin
-[OK]   encrypt     /path/to/age-plugin
-[FAIL] store       /path/to/s3-plugin — connection refused
+[OK]   web         /usr/lib/plinth/plugins/web
+[OK]   gallery     /usr/lib/plinth/plugins/gallery
+[FAIL] hello       /usr/lib/plinth/plugins/hello — connection refused
 ```
 
-If a plugin fails, core doesn't crash. It continues with what works and logs the failures. Pipelines that depend on a failed plugin will error when called, but the rest of the system stays up.
+If an endpoint plugin fails to start, core continues with what works and logs the failure. Requests to that plugin's routes return 503 until it recovers.
 
-### Frontend
+### Crash Recovery
 
-Each plugin owns its frontend while core aggregates navigation from registered plugins.
+If an endpoint plugin process dies during operation, core detects it (go-plugin monitors the subprocess), logs the failure, and restarts the plugin with exponential backoff (1s, 2s, 4s, 8s, max 60s). After 5 consecutive failures, core marks the plugin as permanently failed and stops restarting.
 
-Templating is done via Go templates with HTMX, and PWA is supported. For styling, you can use the shared SDK or roll your own. The web UI itself is a plugin, so if you don't need a UI, just don't load it.
+Core exposes plugin health status via its registry API so endpoint plugins can display it.
+
+## SDK
+
+The SDK (`github.com/pointlet/plinth/sdk`) is the shared contract between core and all plugins. Both core and plugins import it.
+
+```
+core (go.mod) ──imports──► sdk (go.mod) ◄──imports── plugins (go.mod)
+```
+
+### Middleware Interface
+
+```go
+import "github.com/pointlet/plinth/sdk"
+
+type Middleware interface {
+    Name() string
+    Process(ctx context.Context, fc *FileContext, r io.Reader) (io.Reader, *FileContext, error)
+}
+```
+
+### Endpoint Interface
+
+```go
+type Endpoint interface {
+    Name() string
+    BasePath() string
+    DisplayName() string
+}
+```
+
+### Writing a Middleware Plugin (Go)
+
+Implement the interface and register via `init()`:
+
+```go
+package zstd
+
+import (
+    "context"
+    "io"
+
+    "github.com/pointlet/plinth/sdk"
+)
+
+type compressor struct{}
+
+func (c *compressor) Name() string { return "compress" }
+
+func (c *compressor) Process(ctx context.Context, fc *sdk.FileContext, r io.Reader) (io.Reader, *sdk.FileContext, error) {
+    // compress the stream, update metadata
+    fc.Extra["compression"] = "zstd"
+    return newZstdReader(r), fc, nil
+}
+
+func init() {
+    sdk.RegisterMiddleware(&compressor{})
+}
+```
+
+**Creating third-party middleware:**
+
+1. Create a directory anywhere on your filesystem
+2. Initialize a Go module: `go mod init github.com/you/plinth-watermark`
+3. Add the SDK dependency: `go get github.com/pointlet/plinth/sdk`
+4. Implement the `sdk.Middleware` interface and register via `init()`
+5. Users add the path to their `build.yaml` and run `plinth build`
+
+The middleware is compiled into their custom binary and available for use in pipelines.
+
+### Writing an Endpoint Plugin (Go)
+
+Import the SDK and serve with go-plugin:
+
+```go
+package main
+
+import "github.com/pointlet/plinth/sdk"
+
+type gallery struct{}
+
+func (g *gallery) Name() string        { return "gallery" }
+func (g *gallery) BasePath() string     { return "/gallery" }
+func (g *gallery) DisplayName() string  { return "Gallery" }
+
+func main() {
+    sdk.Serve(&gallery{})
+}
+```
+
+### Writing an Endpoint Plugin (Other Languages)
+
+Non-Go plugins must implement the gRPC service contract and the go-plugin handshake protocol.
+
+**1. Check the magic cookie:**
+
+The plugin binary must verify `PLINTH_PLUGIN=1` is set in the environment. If missing, print an error and exit.
+
+**2. Start a gRPC server:**
+
+Generate stubs from the `.proto` files in `proto/` using `protoc`. Implement the `EndpointService` (Health, HandleHTTP, Routes).
+
+**3. Write the handshake line to stdout:**
+
+```
+1|1|unix|<socket_path>|grpc|
+```
+
+This tells go-plugin where to connect. See `proto/README.md` for the full protocol specification.
+
+## Custom Builds
+
+Official middleware (compress, encrypt) is included in the default build. To add third-party middleware, specify local filesystem paths in a build configuration file:
+
+```yaml
+# build.yaml
+middleware:
+  # Third-party middleware (local filesystem paths)
+  watermark: /home/user/my-plugins/watermark
+  transcode: /opt/custom-plugins/transcode
+```
+
+Each middleware directory must be a valid Go module with a `go.mod` file:
+
+```
+/home/user/my-plugins/watermark/
+├── go.mod          # module github.com/user/watermark
+└── watermark.go    # implements sdk.Middleware, registers via init()
+```
+
+Build a custom binary that includes official middleware plus your additions:
+
+```
+plinth build --config build.yaml -o plinth-custom
+```
+
+### How It Works
+
+Go imports require module paths, not filesystem paths. The build tool:
+
+1. Reads the build config and finds each middleware path
+2. Extracts the module path from each middleware's `go.mod`
+3. Adds `replace` directives to map module paths to local paths
+4. Generates import statements for each middleware
+5. Compiles everything into a single binary
+
+The resulting binary contains all official middleware plus your custom middleware, all running in-process with zero serialization overhead.
+
+This is the same pattern used by [xcaddy](https://github.com/caddyserver/xcaddy) for Caddy plugins.
+
+## Configuration
+
+Runtime configuration is defined in a single YAML file. Pass the path with `--config`:
+
+```
+plinth --config /path/to/plinth.yaml
+```
+
+### Example Config
+
+```yaml
+storage:
+  path: ~/.local/share/plinth/files
+
+plugins:
+  # Endpoint plugins (out-of-process binaries)
+  web:
+    binary: /usr/lib/plinth/plugins/web
+  gallery:
+    binary: /usr/lib/plinth/plugins/gallery
+
+pipelines:
+  upload:
+    steps:
+      - compress
+      - encrypt
+    on_error: fail
+
+  download:
+    steps:
+      - decrypt
+      - decompress
+    on_error: fail
+
+  # Pipeline using third-party middleware
+  gallery-upload:
+    steps:
+      - compress
+      - watermark
+      - encrypt
+    on_error: fail
+```
+
+Middleware referenced in pipelines must be compiled into the binary (via `build.yaml`). If a middleware name is not found, core fails at startup with an error.
+
+Endpoint plugins are separate binaries specified by path. They run out-of-process and communicate via gRPC.
 
 ## Tech Stack
 
 | Component | Technology |
 |-----------|------------|
 | Language | Go (pure, no CGo) |
-| Plugin system | HashiCorp go-plugin |
-| IPC | gRPC over Unix sockets |
-| Frontend | Go templates + HTMX |
-| Remote access | VPN / ZTNA (e.g., Twingate) |
+| Endpoint plugin system | HashiCorp go-plugin |
+| Endpoint IPC | gRPC over Unix sockets |
+| Middleware plugin system | In-process Go interfaces |
 
 ## Project Structure
 
+The repository is a multi-module Go workspace. Core, SDK, and each endpoint plugin are separate Go modules, tied together by `go.work` for local development.
+
 ```
 plinth/
+├── go.mod               # core module (imports sdk, never imported externally)
+├── go.work              # workspace for local development
 ├── cmd/
-│   └── plinth/
+│   └── plinth/          # core binary entry point
 ├── internal/
 │   └── core/
-│       ├── storage/
-│       ├── registry/
-│       └── orchestrator/
-│   └── server/
-├── proto/
+│       ├── config/      # YAML config parsing
+│       ├── storage/     # local filesystem storage
+│       ├── registry/    # plugin registration and discovery
+│       └── pipeline/    # pipeline execution (middleware chaining)
+├── proto/               # language-agnostic .proto files
 ├── sdk/
-│   ├── go/
-│   ├── proto/
-│   └── web/
+│   ├── go.mod           # SDK module (github.com/pointlet/plinth/sdk)
+│   ├── sdk.go           # shared contract (interfaces, types)
+│   └── serve.go         # go-plugin serve helpers for endpoint authors
 └── plugin/
-    ├── web/
-    ├── gallery/
-    ├── compress/
-    └── encrypt/
+    ├── web/             # endpoint plugin (own go.mod, own binary)
+    ├── gallery/         # endpoint plugin
+    ├── compress/        # middleware plugin (Go package, imported by core)
+    └── encrypt/         # middleware plugin
 ```
 
 ### Directory Responsibilities
@@ -150,76 +382,84 @@ plinth/
 | Directory | What it does |
 |-----------|--------------|
 | `cmd/plinth/` | Main binary entry point |
-| `internal/` | Private packages that Go enforces, so external projects can't import them |
-| `internal/core/storage/` | File storage engine |
-| `internal/core/registry/` | Plugin registration and discovery |
-| `internal/core/orchestrator/` | Pipeline execution |
-| `internal/server/` | gRPC server wiring |
-| `proto/` | Protocol buffer definitions and generated code |
-| `sdk/` | Public SDK for plugin authors |
-| `sdk/go/` | Go-specific helpers for plugin development |
-| `sdk/proto/` | Proto files for generating stubs in any language |
-| `sdk/web/` | Shared templates and CSS, totally optional |
-| `plugin/` | Official plugins where each subdirectory builds to its own binary |
+| `internal/` | Private packages that Go enforces, no external imports |
+| `internal/core/config/` | YAML config parsing |
+| `internal/core/storage/` | Local filesystem storage engine |
+| `internal/core/registry/` | Plugin registration and health tracking |
+| `internal/core/pipeline/` | Pipeline execution (chains middleware via io.Reader) |
+| `proto/` | Protocol buffer definitions for endpoint plugins |
+| `sdk/` | Go module, shared contract between core and plugins |
+| `plugin/` | Official plugins (endpoints have own go.mod, middleware are Go packages) |
 
-## Plugin Types
+## Storage
 
-| Type | Purpose | Example |
-|------|---------|---------|
-| `endpoint` | Serves a feature with its own routes and UI | gallery, documents |
-| `middleware` | Processes data in pipelines | compress, encrypt |
-
-Endpoint plugins register a path and appear in navigation. Middleware plugins are called as part of other plugins' pipelines.
-
-## Writing Plugins
-
-In Go, you import the SDK, implement the interface, and serve via go-plugin.
-
-In other languages, you grab the `.proto` files from `sdk/proto/`, generate stubs with `protoc`, and implement the gRPC service. Core doesn't care what language you use.
-
-## Configuration
-
-Plinth follows the XDG Base Directory Specification for config file locations.
-
-| Type | Default Location |
-|------|------------------|
-| Config | `~/.config/plinth/` |
-| Data | `~/.local/share/plinth/` |
-| Cache | `~/.cache/plinth/` |
-
-System-wide config can live in `/etc/plinth/`. You can also pass `--config` to override everything.
-
-Precedence: flag → environment variable → user config → system config → defaults.
-
-## Plugin Lifecycle
-
-Core starts plugins and keeps them running. If a plugin binary is updated, core hot-reloads it without restarting itself. Core is the heart of the system and should stay as stable as possible.
-
-## Error Handling
-
-When a pipeline step fails, core skips it and continues with the next step. The health check reports failures with error messages when available. This keeps the system running even when individual plugins have issues.
-
-## Storage Backends
-
-The default storage engine uses the local filesystem. However, the storage layer is pluggable, so you could swap it with an S3-compatible backend if needed.
+The storage engine uses the local filesystem. Files are stored under the configured `storage.path`. The storage API exposes read, write, list, and delete operations to endpoint plugins via gRPC.
 
 ## Authentication
 
-Authentication and authorization are required but the specific approach is not yet decided. The goal is a permission system that's easy to maintain.
+Authentication is deferred until the core functionality works. The eventual design:
+
+- **Plugin-to-core auth:** API key in the config file, presented by plugins when calling core's gRPC API.
+- **User-facing auth:** Owned entirely by the web plugin (sessions, passwords, OAuth).
 
 ## Design Principles
 
-**Core stays dumb.** It stores files and runs pipelines. That's it.
+**Core stays dumb.** It stores files, runs pipelines, and proxies HTTP. That's it.
 
 **Plugins own everything else.** UI, features, processing logic.
 
 **Data flows through core.** Plugins never talk directly to each other.
 
-**Crash isolation.** One plugin dying doesn't kill the system.
+**Crash isolation for endpoints.** One endpoint plugin dying doesn't kill the system.
 
-**Language agnostic.** gRPC means any language can be used for a plugin.
+**Streaming for middleware.** In-process io.Reader chains, zero serialization overhead.
+
+**Language agnostic for endpoints.** gRPC means any language can serve routes.
 
 **Compose your deployment.** Only load what you need.
+
+## Roadmap
+
+### Phase 1: Core + Middleware Pipeline
+
+Proves the pipeline engine works.
+
+- Core binary that reads `plinth.yaml` and initializes storage
+- Local filesystem storage (read, write, list, delete)
+- Pipeline execution engine (chains middleware via `io.Reader`)
+- SDK with `Middleware` and `FileContext` types
+- One real middleware plugin: compress (zstd or gzip)
+- CLI or simple HTTP endpoint that triggers a pipeline (upload a file, get it compressed and stored)
+
+### Phase 2: Endpoint Plugins + Crash Isolation
+
+Proves the crash isolation model works. This is the core value proposition.
+
+- go-plugin integration for launching and managing endpoint subprocesses
+- gRPC service definition for endpoints (Health, HandleHTTP, Routes)
+- Core HTTP reverse proxy (matches paths to plugins, forwards requests)
+- Health check on startup with status reporting
+- Crash detection and automatic restart with exponential backoff
+- One real endpoint plugin: hello (registers a route, serves a page)
+- Demo: kill the endpoint process, core stays up, restarts it, endpoint comes back online
+
+### Phase 3: Web UI + Navigation
+
+Proves the headless model and plugin discovery.
+
+- Web endpoint plugin with Go templates + HTMX
+- Navigation registration convention (endpoint plugins declare routes at startup)
+- Web plugin reads registered routes from core's registry and renders navigation
+- Second endpoint plugin (gallery) to prove multi-plugin navigation
+
+### Phase 4: Polish + Ecosystem
+
+- Encrypt middleware plugin
+- Hot-reload (watch plugin binary, restart on change without restarting core)
+- Non-Go plugin examples (Python endpoint)
+- Authentication (API key for plugin-to-core, user auth in web plugin)
+- XDG Base Directory Specification support for config file locations
+- Additional middleware and endpoint plugins as needed
 
 ## License
 
