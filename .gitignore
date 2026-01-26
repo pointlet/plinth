@@ -1,5 +1,13 @@
 .claude
 
+# Environment files (keep .env.example as template)
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+.env*.local
+
 # Binaries
 plinth
 *.exe
