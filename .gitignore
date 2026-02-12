@@ -1,4 +1,5 @@
 .claude
+.agents
 
 # Environment files (keep .env.example as template)
 .env
