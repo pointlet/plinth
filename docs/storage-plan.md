@@ -1,176 +1,130 @@
 # storage plan (home-server first, replication later)
 
-this is the plan we agreed on.
+this document tracks the current storage architecture for plinth core.
 
-## what we care about
+## goals
 
 - home-server first
-- you own your data
-- local disk is the default and primary path
-- no forced third-party storage
-- storage api should be stable so we can add replication later
-- plugins should keep using the same storage methods over time
+- local disk as primary blob storage
+- stream-first APIs for very large files
+- resumable uploads/downloads
+- stable interfaces so replication can be added later
+- official metadata backend: sqlite
 
-## high-level direction
+## core architecture
 
-start with single-node local storage.
-then add multi-node replication later.
-
-important note:
-
-- single-node mode can be close to stateless at higher layers, but storage itself is local state.
-- replicated multi-node with local copies is a stateful replica model (eventual consistency), not pure stateless shared-storage mode.
-
-that is fine and matches your goal: every machine keeps its own copy.
-
-## core storage shape
-
-`internal/core/storage/storage.go` should be the coordinator layer.
-it should call small internal building blocks instead of doing everything inline.
-
-### building blocks
+`internal/core/storage/storage.go` is the coordinator.
+it composes focused building blocks:
 
 1. `path_resolver.go`
-- maps logical path to safe on-disk path
-- blocks traversal (`..`), absolute escapes, and unsafe symlink behavior
+- maps logical keys to safe filesystem paths
+- blocks traversal and root escape
+- resolves upload temp paths
 
 2. `atomic_writer.go`
-- handles safe streaming writes
-- temp file -> stream copy -> optional fsync -> atomic rename
-- cleanup temp files on error/cancel
+- stream write primitives for object payload bytes
+- atomic single-shot write: temp -> copy -> sync -> rename
+- resumable primitives: append-at-offset, commit temp, abort temp
 
 3. `metadata_store.go`
-- reads/writes file metadata
-- first version can be sidecar json or sqlite-backed metadata
-- keeps metadata logic separate from blob write logic
+- `ObjectStore` interface for committed object records
+- `UploadStore` interface for resumable upload session records
+- both are backend-agnostic contracts
 
-4. `storage.go`
-- high-level methods: `put`, `get`, `stat`, `list`, `delete`, `move`, `copy`
-- composes the three helpers above
+4. `metadata/sqlite/*`
+- official backend implementation
+- one `Store` with one shared `*sql.DB`
+- implements both `ObjectStore` and `UploadStore`
+- sqlite runtime config centralized in `metadata/sqlite/store.go`
 
-## method behavior (v1)
+## high-level storage API (v1 foundation)
 
-- `put`
-  - resolve path
-  - write bytes through atomic writer
-  - persist metadata (size, type, etag, times, extra)
+object operations:
+- `Put`
+- `Open` (range-aware)
+- `Stat`
+- `List`
+- `Delete`
+- `Move`
+- `Copy`
 
-- `get`
-  - resolve path
-  - stream with `os.Open` / `io.ReadCloser`
-  - range support can be added after base path is stable
+resumable upload operations:
+- `CreateUpload`
+- `AppendUpload`
+- `StatUpload`
+- `CommitUpload`
+- `AbortUpload`
 
-- `stat`
-  - resolve path
-  - merge filesystem stat + metadata record
+## resumable model
 
-- `delete`
-  - delete blob + metadata record
+- upload session metadata is stored in `UploadStore`
+- upload bytes are written to temp files on local disk
+- `AppendUpload` enforces expected offset (server is source of truth)
+- `CommitUpload` promotes temp file atomically and finalizes object record
+- `AbortUpload` marks session and removes temp data
 
-- `move`
-  - resolve src/dst
-  - move blob safely
-  - move/update metadata record
+## read model
 
-- `copy`
-  - resolve src/dst
-  - copy blob safely
-  - copy/update metadata record
+- `OpenOptions` supports `Offset` and `Length`
+- use `io.NewSectionReader` for bounded ranged reads
+- supports resume-friendly large downloads
 
-- `list`
-  - list files by prefix
-  - return metadata for each entry
+## metadata model
 
-## metadata and file type handling
+`ObjectInfo` fields (current contract):
 
-core should treat file bytes as opaque.
-core should not parse file internals.
-
-store metadata like:
-
-- namespace
-- path
+- key (namespace + path)
 - size
-- filename
-- content_type
 - etag
-- created_at
-- modified_at
-- extra map
+- content_type
+- filename
+- version
+- deleted (for future tombstones)
+- created_at / modified_at
+- attributes map
 
-type handling:
+## sqlite (official backend)
 
-- if caller sends content-type, store it
-- if missing/generic, detect from initial bytes (`http.DetectContentType`) during stream path
-- downstream plugin decides how to parse bytes
+recommended startup configuration:
 
-## concurrency model
+- `PRAGMA journal_mode = WAL`
+- `PRAGMA synchronous = NORMAL`
+- `PRAGMA foreign_keys = ON`
+- `PRAGMA busy_timeout = 5000`
 
-correctness-critical concurrency goes inside storage layer.
+notes:
+- use a constrained sqlite pool (`max open conns = 1`)
+- metadata writes are small; payload IO remains filesystem streaming
 
-inside storage:
+## sql tooling
 
-- per-path lock for conflicting ops on same path
-- optional global read/write semaphore limits
-- atomic writer semantics always enforced
+- `goose` for schema migrations
+- `sqlc` for typed query generation from SQL files
+- keep object queries and upload queries separate, backed by same db
 
-outside storage (higher layer):
+## implementation order
 
-- rate limiting
-- request throttling
-- background worker pools (later replication)
+phase 1 (single-node correctness):
+1. path resolver safety
+2. file writer atomic + resumable primitives
+3. sqlite schema/migrations (`objects`, `uploads`)
+4. sqlc query generation and store method wiring
+5. engine method wiring (`Put/Open/...` + resumable APIs)
 
-## naming and file layout
+phase 2 (hardening):
+1. context cancellation + cleanup guarantees
+2. offset/idempotency validation
+3. fsync policy and error mapping
+4. crash-recovery behavior for active uploads
 
-common go file naming is lowercase with underscores for multiword names.
-
-recommended files:
-
-- `internal/core/storage/storage.go`
-- `internal/core/storage/path_resolver.go`
-- `internal/core/storage/atomic_writer.go`
-- `internal/core/storage/metadata_store.go`
-
-possible future files:
-
-- `internal/core/storage/versioning.go`
-- `internal/core/storage/events.go`
-- `internal/core/storage/replication_queue.go`
-
-## roadmap
-
-### phase 1: single-node local storage
-
-- local disk blob storage
-- metadata store (simple first)
-- implement `put/get/stat/list/delete/move/copy`
-- strong path safety + atomic writes
-
-### phase 2: replication-ready foundation
-
-- add version/event fields in metadata or change log
-- emit change events after successful write ops
-- keep api stable
-
-### phase 3: multi-node replication
-
-- nodes sync changes and missing blobs
-- each node stores local copy
-- define conflict policy (start with single-writer per namespace)
-- add anti-entropy/reconciliation jobs
-
-## consistency expectations
-
-in replication mode:
-
-- expect eventual consistency unless stronger coordination is added
-- define conflict policy explicitly from day one
-- do not hide conflicts; surface them clearly in metadata/events
+phase 3 (replication-ready):
+1. add change-log/event table
+2. emit events after successful commits/deletes
+3. add anti-entropy worker later
 
 ## practical rule
 
-build and harden single-node storage first.
-make sure write semantics are correct and atomic.
-then add replication on top of the same storage methods.
-
-this keeps complexity under control and avoids rewrites.
+correctness first:
+- never buffer full files in memory
+- do not trust client offsets without verification
+- ensure atomic commit semantics for final object writes
