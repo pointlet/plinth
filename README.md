@@ -293,6 +293,19 @@ The resulting binary contains all official middleware plus your custom middlewar
 
 This is the same pattern used by [xcaddy](https://github.com/caddyserver/xcaddy) for Caddy plugins.
 
+
+## Storage Foundation (Current)
+
+Core storage is being built as a stream-first local filesystem engine with resumable uploads.
+
+- Payload bytes stream directly to local disk (no full-file buffering in memory).
+- `ObjectStore` and `UploadStore` are backend-agnostic interfaces in `internal/core/storage`.
+- Official backend is SQLite in `internal/core/storage/metadata/sqlite`, with one shared DB handle for both object and upload records.
+- Planned DB tooling: `goose` (migrations) + `sqlc` (typed query generation).
+- Range-aware reads are part of the contract for resumable downloads.
+
+See `docs/storage-plan.md` for the active implementation plan.
+
 ## Configuration
 
 Runtime configuration is defined in a single YAML file. Pass the path with `--config`:

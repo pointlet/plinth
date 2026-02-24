@@ -17,5 +17,5 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run tests
-        run: go test -v ./...
+      - name: Run CI checks
+        run: make ci
